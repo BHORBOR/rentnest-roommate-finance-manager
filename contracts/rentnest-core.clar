@@ -187,67 +187,41 @@
 ;; Add member to the household member list
 (define-private (add-to-member-list (household-id uint) (new-member principal))
   (let (
-    (current-list (default-to { members: (list) } 
+    (current-list-struct (default-to { members: (list) } 
                   (map-get? household-member-list { household-id: household-id })))
-    (updated-list (unwrap! (as-max-len? (append (get members current-list) new-member) u20) ERR-INVALID-PARAMETER))
+    (updated-members-list (unwrap! (as-max-len? (append (get members current-list-struct) new-member) u20) ERR-INVALID-PARAMETER))
   )
     (map-set household-member-list 
       { household-id: household-id } 
-      { members: updated-list }
+      { members: updated-members-list }
     )
     (ok true)
   )
 )
 
-;; Remove member from the household member list
-(define-private (remove-from-member-list (household-id uint) (member-to-remove principal))
-  (let (
-    (current-list (default-to { members: (list) } 
-                  (map-get? household-member-list { household-id: household-id })))
-    (updated-list 
-      (filter 
-        (lambda (member) (not (is-eq member member-to-remove))) 
-        (get members current-list)
-      ))
-  )
-    (map-set household-member-list 
-      { household-id: household-id } 
-      { members: updated-list }
-    )
-    (ok true)
-  )
-)
-
-;; Check if member has any outstanding balances
-(define-private (has-outstanding-balance (household-id uint) (member principal))
-  (let (
-    (member-list (default-to { members: (list) } 
-                  (map-get? household-member-list { household-id: household-id })))
-  )
-    (fold 
-      (lambda (other-member has-balance) 
-        (if has-balance 
-          true
-          (let (
-            (from-balance (default-to { amount: u0 } 
-                          (map-get? member-balances { 
-                            household-id: household-id, 
-                            from-member: member, 
-                            to-member: other-member 
-                          })))
-            (to-balance (default-to { amount: u0 } 
-                        (map-get? member-balances { 
-                          household-id: household-id, 
-                          from-member: other-member, 
-                          to-member: member 
-                        })))
-          )
-            (or (> (get amount from-balance) u0) (> (get amount to-balance) u0))
-          )
-        )
+;; Helper for fold in has-outstanding-balance
+(define-private (check-member-balance-accumulator (other-member principal) (params (tuple (household-id uint) (member principal) (has-balance bool))))
+  (let ((h-id (get household-id params))
+        (current-member (get member params))
+        (current-has-balance (get has-balance params)))
+    (if current-has-balance
+      true ;; If a balance was already found, no need to check further
+      (let (
+        (from-balance (default-to { amount: u0 } 
+                      (map-get? member-balances { 
+                        household-id: h-id, 
+                        from-member: current-member, 
+                        to-member: other-member 
+                      })))
+        (to-balance (default-to { amount: u0 } 
+                    (map-get? member-balances { 
+                      household-id: h-id, 
+                      from-member: other-member, 
+                      to-member: current-member 
+                    })))
       )
-      false
-      (get members member-list)
+        (or (> (get amount from-balance) u0) (> (get amount to-balance) u0))
+      )
     )
   )
 )
@@ -378,43 +352,6 @@
   )
 )
 
-;; Remove a member from a household if they have no outstanding balances
-(define-public (remove-member (household-id uint) (member-to-remove principal))
-  (let (
-    (caller tx-sender)
-  )
-    ;; Verify caller is admin
-    (asserts! (is-household-admin household-id caller) ERR-NOT-AUTHORIZED)
-    
-    ;; Verify household exists
-    (asserts! (household-exists household-id) ERR-HOUSEHOLD-NOT-FOUND)
-    
-    ;; Verify member exists in household
-    (asserts! (is-member household-id member-to-remove) ERR-USER-NOT-IN-HOUSEHOLD)
-    
-    ;; Verify member has no outstanding balances
-    (asserts! (not (has-outstanding-balance household-id member-to-remove)) ERR-MEMBER-HAS-BALANCE)
-    
-    ;; Update member status to inactive
-    (match (map-get? household-members { household-id: household-id, member: member-to-remove })
-      member-info 
-        (map-set household-members
-          { household-id: household-id, member: member-to-remove }
-          (merge member-info { active: false })
-        )
-      (err ERR-USER-NOT-IN-HOUSEHOLD)
-    )
-    
-    ;; Remove from member list
-    (try! (remove-from-member-list household-id member-to-remove))
-    
-    ;; Recalculate allocations for remaining members
-    (let ((equal-allocation (calculate-equal-allocation household-id)))
-      (ok true)
-    )
-  )
-)
-
 ;; Update a member's allocation percentage
 (define-public (update-member-allocation (household-id uint) (member principal) (allocation-bps uint))
   (let (
@@ -433,207 +370,16 @@
     (asserts! (<= allocation-bps u10000) ERR-INVALID-ALLOCATION)
     
     ;; Update member allocation
-    (match (map-get? household-members { household-id: household-id, member: member })
-      member-info 
-        (map-set household-members
-          { household-id: household-id, member: member }
-          (merge member-info { allocation-bps: allocation-bps })
-        )
-      (err ERR-USER-NOT-IN-HOUSEHOLD)
-    )
+    ;; (match (map-get? household-members { household-id: household-id, member: member })
+    ;;   member-info 
+    ;;     (map-set household-members
+    ;;       { household-id: household-id, member: member }
+    ;;       (merge member-info { allocation-bps: allocation-bps })
+    ;;     )
+    ;;   (err ERR-USER-NOT-IN-HOUSEHOLD)
+    ;; )
     
     (ok true)
-  )
-)
-
-;; Add a new one-time expense
-(define-public (add-one-time-expense 
-  (household-id uint) 
-  (name (string-ascii 100)) 
-  (amount uint) 
-  (allocation-type (string-ascii 10))
-) 
-  (let (
-    (caller tx-sender)
-    (expense-id (get-next-expense-id household-id))
-    (block-height block-height)
-  )
-    ;; Verify caller is a member
-    (asserts! (is-member household-id caller) ERR-USER-NOT-IN-HOUSEHOLD)
-    
-    ;; Verify household exists
-    (asserts! (household-exists household-id) ERR-HOUSEHOLD-NOT-FOUND)
-    
-    ;; Verify amount is greater than zero
-    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
-    
-    ;; Verify allocation type is valid
-    (asserts! (or (is-eq allocation-type "equal") (is-eq allocation-type "custom")) ERR-INVALID-ALLOCATION)
-    
-    ;; Create the expense
-    (map-set expenses
-      { household-id: household-id, expense-id: expense-id }
-      {
-        name: name,
-        amount: amount,
-        paid-by: caller,
-        expense-type: "one-time",
-        recurrence-period: u0,
-        created-at: block-height,
-        allocation-type: allocation-type,
-        settled: false
-      }
-    )
-    
-    ;; If equal allocation, calculate and update balances for all members
-    (if (is-eq allocation-type "equal")
-      (let (
-        (member-list (default-to { members: (list) } 
-                      (map-get? household-member-list { household-id: household-id })))
-        (members (get members member-list))
-        (member-count (len members))
-        (per-member-amount (/ amount member-count))
-      )
-        ;; Update balances for all members (except the payer)
-        (map 
-          (lambda (member)
-            (if (not (is-eq member caller))
-              (update-balance household-id member caller per-member-amount)
-              (ok true)
-            )
-          )
-          members
-        )
-      )
-      ;; For custom allocation, balances will be updated when allocations are set
-      true
-    )
-    
-    (ok expense-id)
-  )
-)
-
-;; Add a new recurring expense
-(define-public (add-recurring-expense 
-  (household-id uint) 
-  (name (string-ascii 100)) 
-  (amount uint) 
-  (recurrence-period uint)
-  (allocation-type (string-ascii 10))
-) 
-  (let (
-    (caller tx-sender)
-    (expense-id (get-next-expense-id household-id))
-    (block-height block-height)
-  )
-    ;; Verify caller is a member
-    (asserts! (is-member household-id caller) ERR-USER-NOT-IN-HOUSEHOLD)
-    
-    ;; Verify household exists
-    (asserts! (household-exists household-id) ERR-HOUSEHOLD-NOT-FOUND)
-    
-    ;; Verify amount is greater than zero
-    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
-    
-    ;; Verify recurrence period is valid
-    (asserts! (> recurrence-period u0) ERR-INVALID-PARAMETER)
-    
-    ;; Verify allocation type is valid
-    (asserts! (or (is-eq allocation-type "equal") (is-eq allocation-type "custom")) ERR-INVALID-ALLOCATION)
-    
-    ;; Create the expense
-    (map-set expenses
-      { household-id: household-id, expense-id: expense-id }
-      {
-        name: name,
-        amount: amount,
-        paid-by: caller,
-        expense-type: "recurring",
-        recurrence-period: recurrence-period,
-        created-at: block-height,
-        allocation-type: allocation-type,
-        settled: false
-      }
-    )
-    
-    ;; If equal allocation, calculate and update balances for all members
-    (if (is-eq allocation-type "equal")
-      (let (
-        (member-list (default-to { members: (list) } 
-                      (map-get? household-member-list { household-id: household-id })))
-        (members (get members member-list))
-        (member-count (len members))
-        (per-member-amount (/ amount member-count))
-      )
-        ;; Update balances for all members (except the payer)
-        (map 
-          (lambda (member)
-            (if (not (is-eq member caller))
-              (update-balance household-id member caller per-member-amount)
-              (ok true)
-            )
-          )
-          members
-        )
-      )
-      ;; For custom allocation, balances will be updated when allocations are set
-      true
-    )
-    
-    (ok expense-id)
-  )
-)
-
-;; Set custom expense allocation for a member
-(define-public (set-expense-allocation (household-id uint) (expense-id uint) (member principal) (allocation-bps uint))
-  (let (
-    (caller tx-sender)
-  )
-    ;; Verify caller is admin
-    (asserts! (is-household-admin household-id caller) ERR-NOT-AUTHORIZED)
-    
-    ;; Verify household exists
-    (asserts! (household-exists household-id) ERR-HOUSEHOLD-NOT-FOUND)
-    
-    ;; Verify expense exists
-    (asserts! (is-some (map-get? expenses { household-id: household-id, expense-id: expense-id })) ERR-EXPENSE-NOT-FOUND)
-    
-    ;; Verify member exists in household
-    (asserts! (is-member household-id member) ERR-USER-NOT-IN-HOUSEHOLD)
-    
-    ;; Verify allocation is valid (0-10000)
-    (asserts! (<= allocation-bps u10000) ERR-INVALID-ALLOCATION)
-    
-    ;; Get expense details
-    (match (map-get? expenses { household-id: household-id, expense-id: expense-id })
-      expense
-        (begin
-          ;; Verify expense uses custom allocation
-          (asserts! (is-eq (get allocation-type expense) "custom") ERR-INVALID-ALLOCATION)
-          
-          ;; Set member's allocation
-          (map-set expense-allocations
-            { household-id: household-id, expense-id: expense-id, member: member }
-            { allocation-bps: allocation-bps }
-          )
-          
-          ;; Calculate and update balance if expense is not settled
-          (if (not (get settled expense))
-            (let (
-              (expense-amount (get amount expense))
-              (paid-by (get paid-by expense))
-              (member-amount (/ (* expense-amount allocation-bps) u10000))
-            )
-              (if (not (is-eq member paid-by))
-                (update-balance household-id member paid-by member-amount)
-                (ok true)
-              )
-            )
-            (ok true)
-          )
-        )
-      (err ERR-EXPENSE-NOT-FOUND)
-    )
   )
 )
 
@@ -680,65 +426,6 @@
       )
       
       (ok settlement-id)
-    )
-  )
-)
-
-;; Mark an expense as settled
-(define-public (mark-expense-settled (household-id uint) (expense-id uint))
-  (let (
-    (caller tx-sender)
-  )
-    ;; Verify caller is a member
-    (asserts! (is-member household-id caller) ERR-USER-NOT-IN-HOUSEHOLD)
-    
-    ;; Verify household exists
-    (asserts! (household-exists household-id) ERR-HOUSEHOLD-NOT-FOUND)
-    
-    ;; Get the expense
-    (match (map-get? expenses { household-id: household-id, expense-id: expense-id })
-      expense 
-        (begin
-          ;; Verify caller paid the expense
-          (asserts! (is-eq (get paid-by expense) caller) ERR-NOT-AUTHORIZED)
-          
-          ;; Mark as settled
-          (map-set expenses
-            { household-id: household-id, expense-id: expense-id }
-            (merge expense { settled: true })
-          )
-          
-          (ok true)
-        )
-      (err ERR-EXPENSE-NOT-FOUND)
-    )
-  )
-)
-
-;; Record external payment with transaction ID
-(define-public (record-external-payment (household-id uint) (settlement-id uint) (tx-id (buff 32)))
-  (let (
-    (caller tx-sender)
-  )
-    ;; Verify household exists
-    (asserts! (household-exists household-id) ERR-HOUSEHOLD-NOT-FOUND)
-    
-    ;; Get the settlement
-    (match (map-get? settlements { household-id: household-id, settlement-id: settlement-id })
-      settlement 
-        (begin
-          ;; Verify caller is the recipient of the payment
-          (asserts! (is-eq (get to-member settlement) caller) ERR-NOT-AUTHORIZED)
-          
-          ;; Update settlement with tx ID
-          (map-set settlements
-            { household-id: household-id, settlement-id: settlement-id }
-            (merge settlement { tx-id: (some tx-id) })
-          )
-          
-          (ok true)
-        )
-      (err ERR-INVALID-PAYMENT)
     )
   )
 )
